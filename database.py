@@ -9,6 +9,7 @@ from typing import Any
 EXPENSE_CATEGORIES = ("Meat", "Seafood", "Vegetable", "Grocery")
 EXPENSES_TABLE = "expenses"
 BUDGET_TABLE = "budget_requests"
+AUDIT_TABLE = "audit_logs"
 
 _client = None
 
@@ -49,6 +50,11 @@ def init_db() -> None:
     client = get_supabase_client()
     client.table(EXPENSES_TABLE).select("id").limit(1).execute()
     client.table(BUDGET_TABLE).select("id").limit(1).execute()
+    # Optional table; ignore if not created yet.
+    try:
+        client.table(AUDIT_TABLE).select("id").limit(1).execute()
+    except Exception:
+        pass
 
 
 def _today_str() -> str:
@@ -355,3 +361,49 @@ def get_category_weekly_baseline_dict() -> dict[str, float]:
         )
         baseline[cat] = round(total / 4.0, 2)
     return baseline
+
+
+def log_audit_event(
+    *,
+    actor: str,
+    action: str,
+    target_type: str,
+    target_id: int | None = None,
+    details: str = "",
+) -> None:
+    """
+    Write an operation audit log.
+    Expected Supabase table schema:
+      audit_logs(id, timestamp, actor, action, target_type, target_id, details)
+    If table doesn't exist, safely no-op.
+    """
+    try:
+        client = get_supabase_client()
+        payload = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "actor": actor,
+            "action": action,
+            "target_type": target_type,
+            "target_id": target_id,
+            "details": details,
+        }
+        client.table(AUDIT_TABLE).insert(payload).execute()
+    except Exception:
+        # Keep business flow running even if audit table is missing.
+        pass
+
+
+def get_recent_audit_logs(limit: int = 50) -> list[dict[str, Any]]:
+    """Read latest operation logs; returns empty list if table unavailable."""
+    try:
+        client = get_supabase_client()
+        response = (
+            client.table(AUDIT_TABLE)
+            .select("*")
+            .order("timestamp", desc=True)
+            .limit(max(1, int(limit)))
+            .execute()
+        )
+        return list(response.data or [])
+    except Exception:
+        return []
