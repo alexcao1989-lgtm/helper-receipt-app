@@ -68,6 +68,13 @@ def init_session_state() -> None:
         "helper_authenticated": False,
         "employer_authenticated": False,
         "pending_employer_update": None,
+        # Manual input mode state
+        "input_mode": "scanner",  # "scanner" or "manual"
+        "manual_items_df": None,
+        "manual_input_nonce": 0,
+        # Track if submission was successful for UI feedback
+        "last_submission_success": False,
+        "last_submission_count": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -75,8 +82,13 @@ def init_session_state() -> None:
 
 
 def clear_upload_session() -> None:
+    """Completely reset all input states after successful submission."""
     st.session_state.items_df = None
     st.session_state.uploader_nonce += 1
+    st.session_state.manual_items_df = None
+    st.session_state.manual_input_nonce += 1
+    st.session_state.last_submission_success = True
+    st.session_state.last_submission_count = 0
 
 
 def check_helper_password() -> bool:
@@ -234,6 +246,115 @@ def show_review_editor(df: pd.DataFrame) -> pd.DataFrame:
                 "Image URL": st.column_config.TextColumn("Image URL", disabled=True),
             },
         )
+
+
+def show_manual_input_editor() -> pd.DataFrame | None:
+    """
+    Manual input form for adding expenses without AI OCR.
+    Returns a DataFrame with manually entered items or None if no items added.
+    """
+    with st.container(border=True):
+        st.markdown("#### ✍️ Manual Expense Entry")
+        
+        # Create two columns for better UX
+        col1, col2 = st.columns([3, 2])
+        
+        with col1:
+            item_name = st.text_input(
+                "Item Name",
+                placeholder="e.g., Fresh Salmon, Organic Vegetables",
+                key=f"manual_item_name_{st.session_state.manual_input_nonce}",
+            )
+        
+        with col2:
+            category = st.selectbox(
+                "Category",
+                options=CATEGORIES,
+                key=f"manual_category_{st.session_state.manual_input_nonce}",
+            )
+        
+        amount = st.number_input(
+            "Amount (HKD)",
+            min_value=0.0,
+            step=0.1,
+            value=0.0,
+            key=f"manual_amount_{st.session_state.manual_input_nonce}",
+        )
+        
+        # Optional receipt photo upload
+        uploaded_photo = st.file_uploader(
+            "📷 Attach Receipt Photo (Optional)",
+            type=["jpg", "jpeg", "png", "webp"],
+            key=f"manual_photo_{st.session_state.manual_input_nonce}",
+        )
+        
+        image_url = ""
+        if uploaded_photo:
+            with st.spinner("Uploading receipt photo..."):
+                try:
+                    image_url = upload_receipt_to_storage(uploaded_photo)
+                    st.success(f"✅ Receipt photo uploaded")
+                except Exception as exc:
+                    st.error(f"Photo upload failed: {exc}")
+        
+        # Add item button
+        if st.button("➕ Add Item", use_container_width=True, type="secondary"):
+            if not item_name.strip():
+                st.error("Item name is required.")
+                return None
+            if amount <= 0:
+                st.error("Amount must be greater than 0.")
+                return None
+            
+            # Build row data
+            new_row = {
+                "Item Name": item_name.strip(),
+                "Category": category,
+                "AI Price": amount,  # For manual, AI price = user input
+                "Actual Price": amount,
+                "Image URL": image_url,
+            }
+            
+            # Add to dataframe
+            if st.session_state.manual_items_df is None:
+                st.session_state.manual_items_df = pd.DataFrame([new_row])
+            else:
+                st.session_state.manual_items_df = pd.concat(
+                    [st.session_state.manual_items_df, pd.DataFrame([new_row])],
+                    ignore_index=True,
+                )
+            
+            # Reset form inputs by incrementing nonce
+            st.session_state.manual_input_nonce += 1
+            st.success("✅ Item added to list")
+            st.rerun()
+        
+        return None
+
+
+def render_manual_items_review() -> pd.DataFrame | None:
+    """Display and allow editing of manually entered items."""
+    if st.session_state.manual_items_df is None or st.session_state.manual_items_df.empty:
+        return None
+    
+    with st.container(border=True):
+        st.markdown("#### Review Your Manual Entries")
+        
+        edited_df = st.data_editor(
+            st.session_state.manual_items_df.copy(),
+            hide_index=True,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "Item Name": st.column_config.TextColumn("Item Name", required=True),
+                "Category": st.column_config.SelectboxColumn("Category", options=CATEGORIES),
+                "AI Price": st.column_config.NumberColumn("AI Price", format="HK$ %.2f", min_value=0.0, step=0.1),
+                "Actual Price": st.column_config.NumberColumn("Actual Price", format="HK$ %.2f", min_value=0.0, step=0.1),
+                "Image URL": st.column_config.TextColumn("Image URL", disabled=True),
+            },
+        )
+        
+        return edited_df
 
 
 def _plot_category_bar(summary: dict, title: str):
@@ -519,36 +640,123 @@ def render_cost_saving_insights() -> None:
 
 
 def render_helper_scanner_tab() -> None:
+    """
+    Unified expense capture interface with two modes:
+    1. 🤖 AI Scanner - OCR receipt photos
+    2. ✍️ Manual Input - Type in expenses directly
+    """
+    # Display last submission success message
+    if st.session_state.last_submission_success:
+        st.success(f"✅ Receipt recorded successfully! ({st.session_state.last_submission_count} item(s))")
+        st.session_state.last_submission_success = False
+    
+    # Mode selector with tabs
     with st.container(border=True):
-        st.markdown("### Expense Scanner & Uploader")
+        st.markdown("### Expense Capture Method")
+        mode_tabs = st.tabs(["🤖 AI Scanner", "✍️ Manual Input"])
+        
+        with mode_tabs[0]:
+            st.markdown("Upload receipt photos for AI-powered expense extraction")
+            st.session_state.input_mode = "scanner"
+            render_ai_scanner_section()
+        
+        with mode_tabs[1]:
+            st.markdown("Manually enter expense details")
+            st.session_state.input_mode = "manual"
+            render_manual_input_section()
+
+
+def render_ai_scanner_section() -> None:
+    """AI OCR receipt scanning interface."""
+    with st.container(border=True):
+        st.markdown("#### Upload Receipt Photos")
         uploaded_files = st.file_uploader(
-            "Upload one or more receipt photos",
+            "Select one or more receipt images",
             type=["jpg", "jpeg", "png", "webp"],
             accept_multiple_files=True,
             key=f"receipt_uploader_{st.session_state.uploader_nonce}",
         )
-        if uploaded_files and st.button("Recognize All Receipts", type="primary", use_container_width=True):
+        
+        if uploaded_files and st.button("🔍 Recognize All Receipts", type="primary", use_container_width=True):
             try:
                 st.session_state.items_df = recognize_all_receipts(uploaded_files)
-                st.success("OCR completed. Please review before submit.")
+                st.success("✅ OCR completed. Please review before submit.")
             except Exception as exc:
-                st.error(f"OCR/Upload failed: {exc}")
+                st.error(f"❌ OCR/Upload failed: {exc}")
+        
+        # Review and submit AI-recognized items
         if st.session_state.items_df is not None and not st.session_state.items_df.empty:
             edited = show_review_editor(st.session_state.items_df.copy())
             st.session_state.items_df = edited
-            if st.button("Confirm & Submit to Sir", type="primary", use_container_width=True):
+            
+            # Submit button with validation
+            if st.button("✅ Confirm & Submit to Sir", type="primary", use_container_width=True):
                 rows = dataframe_to_db_rows(edited)
-                saved = database.save_expenses(rows)
-                total_actual = sum(float(r["actual_price"]) for r in rows)
-                database.log_audit_event(
-                    actor="Helper",
-                    action="SUBMIT_EXPENSE_BATCH",
-                    target_type="expense_batch",
-                    target_id=None,
-                    details=f"count={saved}, total_actual={total_actual:.2f}",
-                )
-                clear_upload_session()
-                st.success(f"Saved {saved} line item(s).")
+                try:
+                    saved = database.save_expenses(rows)
+                    total_actual = sum(float(r["actual_price"]) for r in rows)
+                    database.log_audit_event(
+                        actor="Helper",
+                        action="SUBMIT_EXPENSE_BATCH",
+                        target_type="expense_batch",
+                        target_id=None,
+                        details=f"count={saved}, total_actual={total_actual:.2f}",
+                    )
+                    
+                    # Update submission state
+                    st.session_state.last_submission_success = True
+                    st.session_state.last_submission_count = saved
+                    
+                    # Clear all input states
+                    clear_upload_session()
+                    
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"❌ Submission failed: {exc}")
+
+
+def render_manual_input_section() -> None:
+    """Manual expense entry interface."""
+    with st.container(border=True):
+        # Show manual input form
+        show_manual_input_editor()
+        
+        # Show review section if items have been added
+        reviewed_df = render_manual_items_review()
+        
+        if st.session_state.manual_items_df is not None and not st.session_state.manual_items_df.empty:
+            # Use reviewed data if available, otherwise use stored data
+            df_to_submit = reviewed_df if reviewed_df is not None else st.session_state.manual_items_df
+            
+            # Submit button
+            if st.button("✅ Confirm & Submit Manual Entries", type="primary", use_container_width=True):
+                rows = dataframe_to_db_rows(df_to_submit)
+                try:
+                    saved = database.save_expenses(rows)
+                    total_actual = sum(float(r["actual_price"]) for r in rows)
+                    database.log_audit_event(
+                        actor="Helper",
+                        action="SUBMIT_MANUAL_EXPENSE_BATCH",
+                        target_type="expense_batch",
+                        target_id=None,
+                        details=f"count={saved}, total_actual={total_actual:.2f}",
+                    )
+                    
+                    # Update submission state
+                    st.session_state.last_submission_success = True
+                    st.session_state.last_submission_count = saved
+                    
+                    # Clear all input states
+                    clear_upload_session()
+                    
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"❌ Submission failed: {exc}")
+            
+            # Clear/Reset button
+            if st.button("🔄 Clear All & Start Over", use_container_width=True, type="secondary"):
+                st.session_state.manual_items_df = None
+                st.session_state.manual_input_nonce += 1
                 st.rerun()
 
 
